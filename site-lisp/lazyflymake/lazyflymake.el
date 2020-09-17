@@ -42,16 +42,33 @@
 
 ;;; Code:
 (require 'cl-lib)
-(require 'flymake)
 (require 'lazyflymake-sdk)
+
+(defcustom lazyflymake-update-interval 2
+  "Interval (seconds) for `lazyflymake-check-buffer'."
+  :group 'lazyflymake
+  :type 'integer)
 
 (defcustom lazyflymake-shell-script-modes '(sh-mode)
   "Major modes for shell script."
   :group 'lazyflymake
   :type '(repeat 'sexp))
 
-(defvar flymake-err-line-patterns)
-(defvar flymake-allowed-file-name-masks)
+(defcustom lazyflymake-check-buffer-max (* 128 1024 1024)
+  "Max size of buffer to run `lazyflymake-check-buffer'."
+  :type 'integer
+  :group 'lazyflymake)
+
+(defvar lazyflymake-errors nil "The syntax errors in current buffer.")
+
+(defvar lazyflymake-overlays nil "The overlays for syntax errors.")
+
+;; Timer to run auto-update tags file
+(defvar lazyflymake-timer nil "Internal timer.")
+
+(defvar lazyflymake-start-check-now nil
+  "If it's t, `lazyflymake-start' starts buffer syntax check immediately.
+This variable is for debug and unit test only.")
 
 ;;;###autoload
 (defun lazyflymake-new-flymake-p ()
@@ -103,6 +120,141 @@ If FORCE is t, the existing set up in `flymake-allowed-file-name-masks' is repla
            ((listp pattern)
             (setq-local flymake-err-line-patterns pattern)))))
       (push (list file-name-regexp init-fn) flymake-allowed-file-name-masks))))
+
+(defun lazyflymake-proc-buffer (&optional force-erase-p)
+  "Get process buffer.  Erase its content if FORCE-ERASE-P is t."
+  (let* ((buf (or (get-buffer "lazyflymake-stdout")
+                  (generate-new-buffer "lazyflymake-stdout"))))
+    (when force-erase-p
+      (with-current-buffer buf
+        (erase-buffer)))
+    buf))
+
+(defun lazyflymake-parse-err-line (text)
+  "Extract error information from TEXT."
+  (let* (rlt (i 0) )
+    (while (and (not rlt)
+                flymake-err-line-patterns
+                (< i (length flymake-err-line-patterns)))
+      (let* ((pattern (nth i flymake-err-line-patterns))
+             (regexp (nth 0 pattern))
+             (file-idx (nth 1 pattern))
+             (line-idx (nth 2 pattern))
+             (col-idx (nth 3 pattern))
+             (err-text-idx (nth 4 pattern))
+             file
+             line
+             col
+             err-text)
+        (when (string-match regexp text)
+          (setq file (and file-idx (match-string file-idx text)))
+          (setq line (and line-idx (match-string line-idx text)))
+          (setq col (and col-idx (match-string col-idx text)))
+          (setq err-text (and err-text-idx (match-string err-text-idx text)))
+          (when (and file line err-text)
+            (setq rlt (list file line col err-text)))))
+      (setq i (1+ i)))
+    rlt))
+
+(defun lazyflymake-clear-overlays ()
+  "Remove existing overlays."
+  (dolist (ov lazyflymake-overlays)
+    (delete-overlay ov)))
+
+(defun lazyflymake-make-overlay (line col err-text)
+  "Create overlay from LINE, COL, ERR-TEXT."
+  (setq col (if col (1- (string-to-number col)) 0))
+  (let* (ov)
+    (save-excursion
+      (goto-char (point-min))
+      (forward-line (1- (string-to-number line)))
+      (setq ov (make-overlay (+ (line-beginning-position) col) (line-end-position)))
+      (overlay-put ov 'category 'flymake-error)
+      (overlay-put ov 'face 'flymake-error)
+      (overlay-put ov 'help-echo err-text)
+      (overlay-put ov 'evaporate t))
+    ov))
+
+(defun lazyflymake-show-errors (output)
+  "Show errors from OUTPUT."
+  (if lazyflymake-debug (message "lazyflymake-show-errors called"))
+  (let* ((lines (split-string output "[\r\n]+"  t "[ \t]+")))
+    (setq lazyflymake-errors nil)
+    ;; extract syntax errors
+    (dolist (l lines)
+      (let* ((err (lazyflymake-parse-err-line l)))
+        (when err
+          (push err lazyflymake-errors))))
+
+    ;; render overlays
+    (save-restriction
+      (widen)
+      (lazyflymake-clear-overlays)
+      ;; make new overlays
+      (dolist (err lazyflymake-errors)
+        (let* ((file (nth 0 err))
+               (line (nth 1 err))
+               (col (nth 2 err))
+               (err-text (nth 3 err))
+               (ov (lazyflymake-make-overlay line col err-text)))
+          (push ov lazyflymake-overlays)
+          ;; algorithms to match file
+          ;; - exactly same as full path name or at least file name is same
+          ;; - don't worry about file name at all
+
+          )))))
+
+(defun lazyflymake-proc-output (process)
+  "The output of PROCESS."
+  (with-current-buffer (process-buffer process)
+    (buffer-string)))
+
+(defun lazyflymake-proc-report (process event)
+  "Handle PROCESS and its EVENT."
+  (ignore event)
+  (let* ((status (process-status process)))
+    (when (memq status '(exit signal))
+      (lazyflymake-show-errors (lazyflymake-proc-output process)))))
+
+(defun lazyflymake-start-buffer-checking-process ()
+  "Check current buffer right now."
+  (let* ((backend (cl-find-if (lambda (m)
+                                (string-match (car m) buffer-file-name))
+                              flymake-allowed-file-name-masks)))
+    (when (and backend
+               ;; only when syntax checking process should be running
+               (memq (process-status "lazyflymake-proc") '(nil exit signal)))
+      (unwind-protect
+          (let* ((flymake-proc--temp-source-file-name nil)
+                 (init-fn (nth 1 backend))
+                 (cmd-and-args (funcall init-fn))
+                 (program (car cmd-and-args))
+                 (args (nth 1 cmd-and-args))
+                 (buf (lazyflymake-proc-buffer t))
+                 (proc (apply 'start-file-process "lazyflymake-proc" buf program args)))
+            (when flymake-proc--temp-source-file-name
+              (process-put proc 'flymake-proc--temp-source-file-name flymake-proc--temp-source-file-name))
+            (set-process-sentinel proc #'lazyflymake-proc-report))))))
+
+(defun lazyflymake-check-buffer ()
+  "Spell check current buffer."
+  (if lazyflymake-debug (message "lazyflymake-check-buffer called."))
+  (cond
+   ((not lazyflymake-timer)
+    ;; start timer if not started yet
+    (setq lazyflymake-timer (current-time)))
+
+   ((< (- (float-time (current-time)) (float-time lazyflymake-timer))
+       lazyflymake-update-interval)
+    ;; do nothing, avoid `flyspell-buffer' too often
+    (if lazyflymake-debug "Flymake syntax check skipped."))
+
+   (t
+    ;; check
+    (setq lazyflymake-timer (current-time))
+    (when (and (< (buffer-size) lazyflymake-check-buffer-max))
+      (lazyflymake-start-buffer-checking-process)
+      (if lazyflymake-debug (message "Flymake syntax checking ..."))))))
 
 (defun lazyflymake-guess-shell-script-regexp ()
   "Guess shell script file name regex."
@@ -191,12 +343,26 @@ If FORCE is t, the existing set up in `flymake-allowed-file-name-masks' is repla
   (unless (derived-mode-p 'js2-mode)
     (lazyflymake-load "\\.[jt]s$" 'eslint))
 
-  (unless flymake-mode (flymake-mode 1)))
+  ;; initialize some internal variables of `flymake-mode'
+  (flymake-mode-on)
+  (flymake-mode-off)
+
+  (cond
+   ;; for debug, unit test, and CI
+   (lazyflymake-start-check-now
+    (lazyflymake-start-buffer-checking-process)
+    (if lazyflymake-debug (message "Flymake syntax checking now ...")))
+
+   (t
+    ;; local hook will override global hook. So have to use local hook
+    ;; here.
+    (add-hook 'after-save-hook #'lazyflymake-check-buffer nil t))))
 
 ;;;###autoload
 (defun lazyflymake-stop ()
   "Turn on lazyflymake to syntax check code."
   (interactive)
+  (remove-hook 'after-save-hook #'lazyflymake-check-buffer t)
 
   (unless (lazyflymake-new-flymake-p)
     (advice-remove 'flymake-goto-next-error #'lazyflymake-echo-error)
