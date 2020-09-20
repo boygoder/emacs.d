@@ -168,7 +168,8 @@ If FORCE is t, the existing set up in `flymake-allowed-file-name-masks' is repla
   (save-excursion
     (widen)
     (dolist (ov lazyflymake-overlays)
-      (delete-overlay ov))))
+      (delete-overlay ov))
+    (setq lazyflymake-overlays nil)))
 
 (defun lazyflymake-make-overlay (line col err-text)
   "Create overlay from LINE, COL, ERR-TEXT."
@@ -267,10 +268,13 @@ If FORCE is t, the existing set up in `flymake-allowed-file-name-masks' is repla
               (process-put proc 'flymake-proc--temp-source-file-name flymake-proc--temp-source-file-name))
             (set-process-sentinel proc #'lazyflymake-proc-report)
 
-            ;; (elisp-flymake-checkdoc (lambda (backend)
-            ;;                           (message "backend=%s" backend)
-            ;;                           ;; (lazyflymake-show-errors a)
-            ;                           ))
+            (when (and (eq major-mode 'emacs-lisp-mode)
+                       (fboundp 'elisp-flymake-checkdoc))
+              (elisp-flymake-checkdoc (lambda (d)
+                                        (message "len=%s diag=%s" (length d) d)
+                                        (message "=========d=%s" (flymake--diag-buffer (nth 0 d)))
+                                        ;; (lazyflymake-show-errors a)
+                                       )))
             )))))
 
 (defun lazyflymake-check-buffer ()
