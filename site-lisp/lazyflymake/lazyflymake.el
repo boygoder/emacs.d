@@ -44,7 +44,8 @@
 (require 'cl-lib)
 (require 'lazyflymake-sdk)
 
-(defcustom lazyflymake-update-interval 2
+;; fixing syntax error costs more time
+(defcustom lazyflymake-update-interval 3
   "Interval (seconds) for `lazyflymake-check-buffer'."
   :group 'lazyflymake
   :type 'integer)
@@ -54,12 +55,17 @@
   :group 'lazyflymake
   :type '(repeat 'sexp))
 
+(defcustom lazyflymake-file-match-algorithm "strict"
+  "The algorithm to match file name.
+If it's \"string\", the full path of file should be same as current code file.
+If it's nil, do not check file at all."
+  :group 'lazyflymake
+  :type 'string)
+
 (defcustom lazyflymake-check-buffer-max (* 128 1024 1024)
   "Max size of buffer to run `lazyflymake-check-buffer'."
   :type 'integer
   :group 'lazyflymake)
-
-(defvar lazyflymake-errors nil "The syntax errors in current buffer.")
 
 (defvar lazyflymake-overlays nil "The overlays for syntax errors.")
 
@@ -156,10 +162,13 @@ If FORCE is t, the existing set up in `flymake-allowed-file-name-masks' is repla
       (setq i (1+ i)))
     rlt))
 
-(defun lazyflymake-clear-overlays ()
-  "Remove existing overlays."
-  (dolist (ov lazyflymake-overlays)
-    (delete-overlay ov)))
+(defun lazyflymake-clear-errors ()
+  "Remove error overlays being displayed."
+  (interactive)
+  (save-excursion
+    (widen)
+    (dolist (ov lazyflymake-overlays)
+      (delete-overlay ov))))
 
 (defun lazyflymake-make-overlay (line col err-text)
   "Create overlay from LINE, COL, ERR-TEXT."
@@ -175,34 +184,55 @@ If FORCE is t, the existing set up in `flymake-allowed-file-name-masks' is repla
       (overlay-put ov 'evaporate t))
     ov))
 
+(defun lazyflymake-current-file-p (file)
+  "FILE does match `buffer-file-name'."
+
+  ;; algorithms to match file
+  ;; - exactly same as full path name or at least file name is same
+  ;; - don't worry about file name at all
+  (let* ((algorithm lazyflymake-file-match-algorithm)
+         rlt)
+    (cond
+     ((or (not buffer-file-name) (not file))
+      (when (not algorithm)
+        (setq rlt t)))
+
+     ((and (string= algorithm "strict")
+           (string= (file-truename buffer-file-name) (file-truename file)))
+      (setq rlt t))
+
+     ((not algorithm)
+      (setq rlt t)))
+
+    rlt))
+
 (defun lazyflymake-show-errors (output)
   "Show errors from OUTPUT."
   (if lazyflymake-debug (message "lazyflymake-show-errors called"))
-  (let* ((lines (split-string output "[\r\n]+"  t "[ \t]+")))
-    (setq lazyflymake-errors nil)
+  (let* ((lines (split-string output "[\r\n]+"  t "[ \t]+"))
+         errors
+         (ovs lazyflymake-overlays))
+
     ;; extract syntax errors
     (dolist (l lines)
       (let* ((err (lazyflymake-parse-err-line l)))
         (when err
-          (push err lazyflymake-errors))))
+          (push err errors))))
 
     ;; render overlays
     (save-restriction
       (widen)
-      (lazyflymake-clear-overlays)
       ;; make new overlays
-      (dolist (err lazyflymake-errors)
+      (dolist (err errors)
         (let* ((file (nth 0 err))
                (line (nth 1 err))
                (col (nth 2 err))
-               (err-text (nth 3 err))
-               (ov (lazyflymake-make-overlay line col err-text)))
-          (push ov lazyflymake-overlays)
-          ;; algorithms to match file
-          ;; - exactly same as full path name or at least file name is same
-          ;; - don't worry about file name at all
-
-          )))))
+               (err-text (nth 3 err)))
+          (when (or (lazyflymake-current-file-p file)
+                    (eq major-mode 'emacs-lisp-mode))
+            (push (lazyflymake-make-overlay line col err-text) ovs))))
+      (setq lazyflymake-overlays
+            (sort ovs (lambda (a b) (< (overlay-start a) (overlay-start b))))))))
 
 (defun lazyflymake-proc-output (process)
   "The output of PROCESS."
@@ -232,9 +262,16 @@ If FORCE is t, the existing set up in `flymake-allowed-file-name-masks' is repla
                  (args (nth 1 cmd-and-args))
                  (buf (lazyflymake-proc-buffer t))
                  (proc (apply 'start-file-process "lazyflymake-proc" buf program args)))
+            (lazyflymake-clear-errors)
             (when flymake-proc--temp-source-file-name
               (process-put proc 'flymake-proc--temp-source-file-name flymake-proc--temp-source-file-name))
-            (set-process-sentinel proc #'lazyflymake-proc-report))))))
+            (set-process-sentinel proc #'lazyflymake-proc-report)
+
+            ;; (elisp-flymake-checkdoc (lambda (backend)
+            ;;                           (message "backend=%s" backend)
+            ;;                           ;; (lazyflymake-show-errors a)
+            ;                           ))
+            )))))
 
 (defun lazyflymake-check-buffer ()
   "Spell check current buffer."
@@ -311,10 +348,57 @@ If FORCE is t, the existing set up in `flymake-allowed-file-name-masks' is repla
                    (lazyflymake--extract-err output (nth 4 pattern))))
         (setq i (1+ i))))))
 
+(defun lazyflymake-overlay-at-point (&optional position)
+  "Find overlay at POSITION."
+  (unless position (setq position (point)))
+  (save-excursion
+    (goto-char position)
+    (cl-find-if (lambda (ov)
+                  (eq 'flymake-error (overlay-get ov 'category)))
+                (overlays-in (line-beginning-position) (line-end-position)))))
+
 (defun lazyflymake-echo-error (&optional arg)
   "Echo error at point.  ARG is ignored."
   (ignore arg)
-  (message (lazyflymake--legacy-info-at-point)))
+  (cond
+   (flymake-mode
+    (message (lazyflymake--legacy-info-at-point)))
+   (t
+    (let* ((ov (lazyflymake-overlay-at-point)))
+      (when ov
+        (message "%s" (overlay-get ov 'help-echo)))))))
+
+(defun lazyflymake-goto-overlay-center (overlay)
+  "Go to center of OVERLAY."
+  (goto-char (/ (+ (overlay-start overlay) (overlay-end overlay)) 2)))
+
+(defun lazyflymake-goto-next-error ()
+  "Got to next syntax error."
+  (interactive)
+  (cond
+   (flymake-mode
+    (flymake-goto-next-error))
+   (t
+    (let* ((start (line-end-position))
+           (ov (cl-find-if `(lambda (ov) (< ,start (overlay-start ov)))
+                           lazyflymake-overlays)))
+      (when ov
+        (lazyflymake-goto-overlay-center ov)
+        (lazyflymake-echo-error))))))
+
+(defun lazyflymake-goto-prev-error ()
+  "Got to previous syntax error."
+  (interactive)
+  (cond
+   (flymake-mode
+    (flymake-goto-prev-error))
+   (t
+    (let* ((start (line-beginning-position))
+           (ov (cl-find-if `(lambda (ov) (> ,start (overlay-end ov)))
+                           (nreverse lazyflymake-overlays))))
+      (when ov
+        (lazyflymake-goto-overlay-center ov)
+        (lazyflymake-echo-error))))))
 
 ;;;###autoload
 (defun lazyflymake-start ()
@@ -322,8 +406,9 @@ If FORCE is t, the existing set up in `flymake-allowed-file-name-masks' is repla
   (interactive)
 
   ;; set up `flymake-allowed-file-name-masks'
-  ;; Emacs 26 has its own elisp syntax init
-  (unless (lazyflymake-new-flymake-p) (lazyflymake-load "\\.el$" 'elisp))
+  ;; `elisp-flymake-byte-compile' is similar to our own flymake init function
+  ;; `elisp-flymake-checkdoc' is called directly
+  (lazyflymake-load "\\.el$" 'elisp)
 
   ;; set log level to WARNING, so we could see error message in echo area
   (unless (lazyflymake-new-flymake-p)

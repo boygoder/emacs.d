@@ -32,5 +32,8 @@
     (if lazyflymake-debug (message "lazyflymake-sdk-code-file => %s" rlt))
     rlt))
 
+(defun lazyflymake-sdk-parent-directory (file)
+  "Get parent directory name of file."
+  )
 (provide 'lazyflymake-sdk)
 ;;; lazyflymake-sdk.el ends here
